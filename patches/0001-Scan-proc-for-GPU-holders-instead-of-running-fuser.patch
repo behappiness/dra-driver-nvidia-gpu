@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: swibrow <15628653+swibrow@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 05:51:17 +0200
+Subject: [PATCH 1/7] Scan /proc for GPU holders instead of running fuser
+
+With PassthroughSupport enabled, WaitForGPUFree runs
+'chroot <host-root> fuser <driver-root>/dev/nvidiaN' before rebinding a
+GPU to vfio-pci. On hosts without fuser (e.g. Talos Linux) chroot exits
+127 on every attempt, so the check loops until gpuFreeCheckTimeout and
+NodePrepareResources fails.
+
+Replace the fuser call with a scan of /proc/<pid>/fd in the host PID
+namespace (mounted at /proc when PassthroughSupport is enabled) for
+character devices matching the GPU's major:minor. This needs no host
+binary, also catches containerized clients that have their own device
+nodes, and names the holding processes as <pid>(<exe>) in the error.
+
+Signed-off-by: swibrow <15628653+swibrow@users.noreply.github.com>
+(cherry picked from commit 8cbd603e42969d2ef44ef3a13683220ed65232c8)
+---
+ cmd/gpu-kubelet-plugin/vfio-device.go         | 94 +++++++++++++++----
+ .../vfio-device_linux_test.go                 | 88 +++++++++++++++++
+ go.mod                                        |  2 +-
+ 3 files changed, 165 insertions(+), 19 deletions(-)
+ create mode 100644 cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
+
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device.go b/cmd/gpu-kubelet-plugin/vfio-device.go
+index 46e3fbd4..8ae2aa19 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device.go
+@@ -25,10 +25,12 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+ 
++	"golang.org/x/sys/unix"
+ 	"k8s.io/klog/v2"
+ )
+ 
+@@ -42,8 +44,13 @@ const (
+ 	vfioDevicesPath              = "/dev/vfio/devices"
+ 	iommuDevicePath              = "/dev/iommu"
+ 	nvidiaPersistencedSocketPath = "/run/nvidia-persistenced/socket"
+-	gpuFreeCheckInterval         = 1 * time.Second
+-	gpuFreeCheckTimeout          = 60 * time.Second
++	// The kubelet plugin mounts the host's /proc here when PassthroughSupport
++	// is enabled, so it lists every process in the host PID namespace.
++	procRoot = "/proc"
++	// NV_MAJOR_DEVICE_NUMBER: /dev/nvidia<minor> is always char device 195:<minor>.
++	nvidiaDeviceMajor    = 195
++	gpuFreeCheckInterval = 1 * time.Second
++	gpuFreeCheckTimeout  = 60 * time.Second
+ 	// Keep driverChangeTimeout short to avoid blocking the plugin process
+ 	// for too long from serving other device preparation/unpreparation
+ 	// requests.
+@@ -161,13 +168,11 @@ func (vm *VfioPciManager) Configure(ctx context.Context, info *VfioDeviceInfo) e
+ // WaitForGPUFree does a best effort scan of the GPU clients running on the host and
+ // waits for them to exit on their own.
+ //
+-// This polls the GPU's /dev/nvidia* device node in the driver installation path on
+-// the host periodically to see if any process has open fds to it. This acts as a
+-// limited safety net to ensure that we don't mistakenly try to unbind a GPU from
+-// the nvidia driver while it is busy.
+-// Note: Here, we can only check if there are any GPU clients running on the host rootfs
+-// where the driver is installed. If you have containerized GPU clients that work
+-// with their own view of the device nodes, we will not able to detect it.
++// This periodically scans the host's /proc for processes with open fds to the
++// GPU's /dev/nvidia<minor> character device. This acts as a limited safety net
++// to ensure that we don't mistakenly try to unbind a GPU from the nvidia driver
++// while it is busy. Matching by device number rather than path also detects
++// containerized GPU clients that work with their own view of the device nodes.
+ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceInfo) error {
+ 	if info.parent == nil {
+ 		return nil
+@@ -176,29 +181,82 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
+ 	ticker := time.NewTicker(gpuFreeCheckInterval)
+ 	defer ticker.Stop()
+ 
+-	gpuDeviceNode := filepath.Join(vm.hostDriverRoot, "dev", fmt.Sprintf("nvidia%d", info.parent.minor))
+ 	var err error
+ 	for {
+ 		select {
+ 		case <-timeout:
+ 			return fmt.Errorf("timed out waiting for gpu to be free: %w", err)
+ 		case <-ticker.C:
+-			out, cmdErr := execCommandWithChroot(vm.nvlib.hostRoot, "fuser", []string{gpuDeviceNode}) //nolint:gosec
+-			if cmdErr != nil {
+-				// fuser returns exit code 1 if no process is using the device.
+-				if exitErr, ok := cmdErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+-					return nil
+-				}
+-				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, cmdErr)
++			holders, scanErr := findCharDeviceHolders(procRoot, nvidiaDeviceMajor, uint32(info.parent.minor)) //nolint:gosec
++			if scanErr != nil {
++				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, scanErr)
+ 				klog.V(6).Infof("%v", err)
+ 				continue
+ 			}
+-			err = fmt.Errorf("gpu device %q has open fds by process(es): %q", info.PciBusID, string(out))
++			if len(holders) == 0 {
++				return nil
++			}
++			err = fmt.Errorf("gpu device %q has open fds by process(es): %s", info.PciBusID, strings.Join(holders, ","))
+ 			klog.V(6).Infof("%v", err)
+ 		}
+ 	}
+ }
+ 
++// findCharDeviceHolders returns "<pid>(<exe>)" for every process under procRoot
++// holding an open fd to the character device major:minor. Processes that exit
++// or whose fds cannot be read mid-scan are skipped.
++func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, error) {
++	procs, err := os.ReadDir(procRoot)
++	if err != nil {
++		return nil, fmt.Errorf("error listing %q: %w", procRoot, err)
++	}
++	var holders []string
++	for _, p := range procs {
++		// Only the numeric entries of /proc are processes; the rest (self,
++		// sys, meminfo, ...) are kernel interfaces.
++		if _, err := strconv.Atoi(p.Name()); err != nil {
++			continue
++		}
++		// /proc/<pid>/fd holds one symlink per open fd. Listing it fails with
++		// ENOENT for a process that exited mid-scan, and with EACCES for one
++		// we may not inspect, which the privileged plugin does not expect;
++		// either way there is nothing to check, so skip it.
++		fdDir := filepath.Join(procRoot, p.Name(), "fd")
++		fds, err := os.ReadDir(fdDir)
++		if err != nil {
++			continue
++		}
++		for _, fd := range fds {
++			// Stat follows the fd symlink to the open file itself, so this
++			// works even when the process sees the device node under a path
++			// that does not exist in our mount namespace.
++			var st unix.Stat_t
++			if err := unix.Stat(filepath.Join(fdDir, fd.Name()), &st); err != nil {
++				continue
++			}
++			// A character device is identified by the major:minor packed into
++			// st_rdev, regardless of the node's name or location.
++			rdev := uint64(st.Rdev) //nolint:gosec,unconvert
++			if uint32(st.Mode)&unix.S_IFMT == unix.S_IFCHR && unix.Major(rdev) == major && unix.Minor(rdev) == minor {
++				holders = append(holders, fmt.Sprintf("%s(%s)", p.Name(), processExeName(procRoot, p.Name())))
++				break
++			}
++		}
++	}
++	return holders, nil
++}
++
++// processExeName returns the basename of /proc/<pid>/exe. Unlike
++// /proc/<pid>/comm it is not truncated to 15 bytes. It is empty when the link
++// cannot be read, e.g. for a process that exited mid-scan.
++func processExeName(procRoot, pid string) string {
++	exe, err := os.Readlink(filepath.Join(procRoot, pid, "exe"))
++	if err != nil {
++		return ""
++	}
++	return filepath.Base(exe)
++}
++
+ // Unconfigure binds the GPU to the nvidia driver.
+ func (vm *VfioPciManager) Unconfigure(ctx context.Context, info *VfioDeviceInfo) error {
+ 	// Do nothing if we dont expect to switch to nvidia driver.
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go b/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
+new file mode 100644
+index 00000000..ee122dd7
+--- /dev/null
++++ b/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
+@@ -0,0 +1,88 @@
++/*
++Copyright The Kubernetes Authors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package main
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestFindCharDeviceHolders(t *testing.T) {
++	f, err := os.Open("/dev/null")
++	require.NoError(t, err)
++	defer f.Close()
++
++	exe, err := os.Executable()
++	require.NoError(t, err)
++	self := fmt.Sprintf("%d(%s)", os.Getpid(), filepath.Base(exe))
++
++	tests := map[string]struct {
++		procRoot     string
++		major, minor uint32
++		wantSelf     bool
++		wantErr      bool
++	}{
++		"device held by this process": {
++			procRoot: "/proc",
++			major:    1,
++			minor:    3,
++			wantSelf: true,
++		},
++		"device not held by this process": {
++			procRoot: "/proc",
++			major:    nvidiaDeviceMajor,
++			minor:    4095,
++		},
++		"missing proc root": {
++			procRoot: filepath.Join(t.TempDir(), "missing"),
++			major:    1,
++			minor:    3,
++			wantErr:  true,
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			holders, err := findCharDeviceHolders(tc.procRoot, tc.major, tc.minor)
++			if tc.wantErr {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			if tc.wantSelf {
++				require.Contains(t, holders, self)
++			} else {
++				require.NotContains(t, holders, self)
++			}
++		})
++	}
++}
++
++func TestWaitForGPUFree(t *testing.T) {
++	vm := &VfioPciManager{}
++	info := &VfioDeviceInfo{parent: &GpuInfo{minor: 4095}}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	require.NoError(t, vm.WaitForGPUFree(ctx, info))
++}
+diff --git a/go.mod b/go.mod
+index ce8eb62b..f5f8c5fe 100644
+--- a/go.mod
++++ b/go.mod
+@@ -17,6 +17,7 @@ require (
+ 	github.com/spf13/pflag v1.0.10
+ 	github.com/stretchr/testify v1.12.1
+ 	github.com/urfave/cli/v2 v2.27.7
++	golang.org/x/sys v0.49.0
+ 	golang.org/x/time v0.15.0
+ 	google.golang.org/grpc v1.84.0
+ 	k8s.io/api v0.37.0
+@@ -89,7 +90,6 @@ require (
+ 	golang.org/x/net v0.60.0 // indirect
+ 	golang.org/x/oauth2 v0.36.0 // indirect
+ 	golang.org/x/sync v0.24.0 // indirect
+-	golang.org/x/sys v0.49.0 // indirect
+ 	golang.org/x/term v0.46.0 // indirect
+ 	golang.org/x/text v0.43.0 // indirect
+ 	golang.org/x/tools v0.51.0 // indirect

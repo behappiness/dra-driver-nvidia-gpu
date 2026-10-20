@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: swibrow <15628653+swibrow@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 20:37:03 +0200
+Subject: [PATCH 3/7] Keep the graphics auxiliary device on vfio across driver
+ switches
+
+nvpassthrough.Unbind also unbinds the GPU's graphics auxiliary (HDMI
+audio) function and clears its driver_override, and BindToDriver only
+binds the GPU back. A host that binds the audio function to vfio-pci for
+passthrough lost it on every VM start and stop, so KubeVirt could not
+attach it.
+
+Unbind only the GPU function, and when switching to vfio, move the
+auxiliary function there too via BindToVFIODriver.
+
+Signed-off-by: swibrow <15628653+swibrow@users.noreply.github.com>
+(cherry picked from commit d70a885e2c36bb5512779226b8447953d6377ff2)
+---
+ cmd/gpu-kubelet-plugin/vfio-device.go      | 26 +++++++++-
+ cmd/gpu-kubelet-plugin/vfio-device_test.go | 59 ++++++++++++++++++++++
+ 2 files changed, 84 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device.go b/cmd/gpu-kubelet-plugin/vfio-device.go
+index 81af2849..bcc2d848 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device.go
+@@ -384,7 +384,7 @@ func (vm *VfioPciManager) changeDriver(pciAddress, driver string) error {
+ 	}
+ 
+ 	if currentDriver != "" {
+-		err := vm.nvlib.nvpasst.Unbind(pciAddress)
++		err := unbindDevice(pciDevicesPath, pciAddress)
+ 		if err != nil {
+ 			return fmt.Errorf("error unbinding GPU %q from driver %q: %w", pciAddress, currentDriver, err)
+ 		}
+@@ -394,6 +394,30 @@ func (vm *VfioPciManager) changeDriver(pciAddress, driver string) error {
+ 	if err != nil {
+ 		return fmt.Errorf("error binding GPU %q to driver %q: %w", pciAddress, driver, err)
+ 	}
++
++	// The GPU is already on vfio here, so this only moves its graphics
++	// auxiliary (HDMI audio) function, which a VM needs alongside it.
++	if driver != nvidiaDriver {
++		err = vm.nvlib.nvpasst.BindToVFIODriver(pciAddress)
++		if err != nil {
++			return fmt.Errorf("error binding auxiliary devices of GPU %q to vfio: %w", pciAddress, err)
++		}
++	}
++	return nil
++}
++
++// Unbind only the GPU function. nvpassthrough.Unbind also unbinds the graphics
++// auxiliary function and clears its driver_override, and nothing binds it
++// back, so a host that keeps it on vfio-pci for passthrough loses it on every
++// driver switch.
++func unbindDevice(pciDevicesPath, pciAddress string) error {
++	devicePath := filepath.Join(pciDevicesPath, pciAddress)
++	if err := os.WriteFile(filepath.Join(devicePath, "driver_override"), []byte("\n"), 0644); err != nil {
++		return fmt.Errorf("failed to clear driver_override: %w", err)
++	}
++	if err := os.WriteFile(filepath.Join(devicePath, "driver", "unbind"), []byte(pciAddress), 0644); err != nil && !errors.Is(err, fs.ErrNotExist) {
++		return fmt.Errorf("failed to unbind: %w", err)
++	}
+ 	return nil
+ }
+ 
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device_test.go b/cmd/gpu-kubelet-plugin/vfio-device_test.go
+index 7485698b..5b65c672 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device_test.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device_test.go
+@@ -100,6 +100,65 @@ func TestHostRootBinaryPath(t *testing.T) {
+ 	})
+ }
+ 
++func TestUnbindDevice(t *testing.T) {
++	const (
++		gpuAddress = "0000:01:00.0"
++		auxAddress = "0000:01:00.1"
++	)
++
++	tests := map[string]struct {
++		gpuBound bool
++	}{
++		"gpu bound to a driver": {gpuBound: true},
++		"gpu not bound":         {},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			pciDevicesPath := t.TempDir()
++			pciDriversPath := t.TempDir()
++			for _, addr := range []string{gpuAddress, auxAddress} {
++				require.NoError(t, os.MkdirAll(filepath.Join(pciDevicesPath, addr), 0o755))
++			}
++
++			nvidiaUnbind := filepath.Join(pciDriversPath, "nvidia", "unbind")
++			vfioUnbind := filepath.Join(pciDriversPath, "vfio-pci", "unbind")
++			for _, unbind := range []string{nvidiaUnbind, vfioUnbind} {
++				require.NoError(t, os.MkdirAll(filepath.Dir(unbind), 0o755))
++				require.NoError(t, os.WriteFile(unbind, nil, 0o644))
++			}
++			if tc.gpuBound {
++				require.NoError(t, os.WriteFile(filepath.Join(pciDevicesPath, gpuAddress, "driver_override"), []byte("nvidia"), 0o644))
++				require.NoError(t, os.Symlink(filepath.Dir(nvidiaUnbind), filepath.Join(pciDevicesPath, gpuAddress, "driver")))
++			}
++			auxOverride := filepath.Join(pciDevicesPath, auxAddress, "driver_override")
++			require.NoError(t, os.WriteFile(auxOverride, []byte("vfio-pci"), 0o644))
++			require.NoError(t, os.Symlink(filepath.Dir(vfioUnbind), filepath.Join(pciDevicesPath, auxAddress, "driver")))
++
++			require.NoError(t, unbindDevice(pciDevicesPath, gpuAddress))
++
++			override, err := os.ReadFile(filepath.Join(pciDevicesPath, gpuAddress, "driver_override"))
++			require.NoError(t, err)
++			require.Equal(t, "\n", string(override))
++			unbound, err := os.ReadFile(nvidiaUnbind)
++			require.NoError(t, err)
++			if tc.gpuBound {
++				require.Equal(t, gpuAddress, string(unbound))
++			} else {
++				require.Empty(t, unbound)
++			}
++
++			// The auxiliary function keeps its driver and override.
++			auxUnbound, err := os.ReadFile(vfioUnbind)
++			require.NoError(t, err)
++			require.Empty(t, auxUnbound)
++			auxOverrideValue, err := os.ReadFile(auxOverride)
++			require.NoError(t, err)
++			require.Equal(t, "vfio-pci", string(auxOverrideValue))
++		})
++	}
++}
++
+ func TestTryChangeDriverWithTimeout(t *testing.T) {
+ 	vm := &VfioPciManager{
+ 		nvidiaEnabled: true,

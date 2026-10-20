@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Botond Lovasz <botilovasz@gmail.com>
+Date: Tue, 20 Oct 2026 23:48:38 +0200
+Subject: [PATCH 6/7] Let GPU clients that release on unbind not block a vfio
+ switch
+
+dcgm-exporter keeps every GPU open, and with its bind/unbind watch
+(detached-GPU support, driver 590+ / DCGM 4.5+) it lets go of a GPU once
+the nvidia driver starts unbinding it. The holder scan rightly counts it,
+so a switch to vfio could never start while dcgm-exporter runs, short of
+evicting it first.
+
+--vfio-unbind-releasing-holders (VFIO_UNBIND_RELEASING_HOLDERS) names
+such clients by executable. They no longer block the switch; any other
+holder, or one whose executable cannot be read, still does. Empty by
+default, so nothing changes unless it is set.
+---
+ cmd/gpu-kubelet-plugin/device_state.go        |  1 +
+ cmd/gpu-kubelet-plugin/main.go                |  7 +++
+ cmd/gpu-kubelet-plugin/vfio-device.go         | 61 +++++++++++++++++--
+ .../vfio-device_linux_test.go                 |  2 +-
+ cmd/gpu-kubelet-plugin/vfio-device_test.go    | 38 ++++++++++++
+ 5 files changed, 102 insertions(+), 7 deletions(-)
+
+diff --git a/cmd/gpu-kubelet-plugin/device_state.go b/cmd/gpu-kubelet-plugin/device_state.go
+index e7db7479..30bac592 100644
+--- a/cmd/gpu-kubelet-plugin/device_state.go
++++ b/cmd/gpu-kubelet-plugin/device_state.go
+@@ -200,6 +200,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
+ 		if err != nil {
+ 			return nil, fmt.Errorf("unable to create vfio pci manager: %w", err)
+ 		}
++		vfioPciManager.releasingHolders = splitList(config.flags.vfioUnbindReleasingHolders)
+ 	}
+ 
+ 	fmManager, err := newFabricManager(nvdevlib, containerDriverRoot)
+diff --git a/cmd/gpu-kubelet-plugin/main.go b/cmd/gpu-kubelet-plugin/main.go
+index 9ddd0a67..aa8f7081 100644
+--- a/cmd/gpu-kubelet-plugin/main.go
++++ b/cmd/gpu-kubelet-plugin/main.go
+@@ -68,6 +68,7 @@ type Flags struct {
+ 	klogVerbosity                 int
+ 	additionalXidsToIgnore        string
+ 	consumableShares              string
++	vfioUnbindReleasingHolders    string
+ }
+ 
+ type Config struct {
+@@ -217,6 +218,12 @@ func newApp() *cli.App {
+ 			Destination: &flags.consumableShares,
+ 			EnvVars:     []string{"CONSUMABLE_SHARES"},
+ 		},
++		&cli.StringFlag{
++			Name:        "vfio-unbind-releasing-holders",
++			Usage:       "A comma-separated list of executable names of GPU clients that release the GPU when it is unbound from the nvidia driver (e.g. dcgm-exporter with its bind/unbind watch), so they do not block a switch to vfio. Any other open fd still blocks it.",
++			Destination: &flags.vfioUnbindReleasingHolders,
++			EnvVars:     []string{"VFIO_UNBIND_RELEASING_HOLDERS"},
++		},
+ 	}
+ 	cliFlags = append(cliFlags, flags.kubeClientConfig.Flags()...)
+ 	cliFlags = append(cliFlags, featureGateConfig.Flags()...)
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device.go b/cmd/gpu-kubelet-plugin/vfio-device.go
+index d7491770..a67d1ee5 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device.go
+@@ -25,6 +25,7 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -66,6 +67,10 @@ type VfioPciManager struct {
+ 	hostDriverRoot      string
+ 	nvlib               *deviceLib
+ 	nvidiaEnabled       bool
++	// Executable names of GPU clients that release the GPU when it is unbound
++	// from the nvidia driver, so they do not block a switch to vfio (e.g.
++	// dcgm-exporter with its bind/unbind watch).
++	releasingHolders []string
+ 
+ 	inflightDriverSwitches map[string]struct{}
+ }
+@@ -200,10 +205,14 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
+ 			if scanErr != nil {
+ 				return fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, scanErr)
+ 			}
+-			if len(holders) == 0 {
++			blocking := vm.blockingHolders(holders)
++			if len(blocking) == 0 {
++				if len(holders) > 0 {
++					klog.Infof("GPU %q is still open by %s, which release it on unbind", info.PciBusID, joinHolders(holders))
++				}
+ 				return nil
+ 			}
+-			err = fmt.Errorf("gpu device %q has open fds by process(es): %s", info.PciBusID, strings.Join(holders, ","))
++			err = fmt.Errorf("gpu device %q has open fds by process(es): %s", info.PciBusID, joinHolders(blocking))
+ 			klog.V(6).Infof("%v", err)
+ 		}
+ 	}
+@@ -222,16 +231,56 @@ func checkHostPIDNamespace(procRoot string) error {
+ 	return nil
+ }
+ 
+-// findCharDeviceHolders returns "<pid>(<exe>)" for every process under procRoot
++// blockingHolders returns the holders not known to release the GPU on unbind.
++func (vm *VfioPciManager) blockingHolders(holders []gpuHolder) []gpuHolder {
++	var blocking []gpuHolder
++	for _, h := range holders {
++		if h.exe == "" || !slices.Contains(vm.releasingHolders, h.exe) {
++			blocking = append(blocking, h)
++		}
++	}
++	return blocking
++}
++
++// gpuHolder is a process holding an open fd to a GPU device node.
++type gpuHolder struct {
++	pid string
++	exe string
++}
++
++func (h gpuHolder) String() string {
++	return fmt.Sprintf("%s(%s)", h.pid, h.exe)
++}
++
++func joinHolders(holders []gpuHolder) string {
++	names := make([]string, len(holders))
++	for i, h := range holders {
++		names[i] = h.String()
++	}
++	return strings.Join(names, ",")
++}
++
++// splitList splits a comma-separated flag value, dropping empty entries.
++func splitList(s string) []string {
++	var out []string
++	for _, v := range strings.Split(s, ",") {
++		if v = strings.TrimSpace(v); v != "" {
++			out = append(out, v)
++		}
++	}
++	return out
++}
++
++// findCharDeviceHolders returns every process under procRoot
+ // holding an open fd to the character device major:minor. Processes and fds
+ // that disappear mid-scan are skipped; any other error fails the scan, since
+ // a process it cannot inspect may be holding the device.
+-func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, error) {
++func findCharDeviceHolders(procRoot string, major, minor uint32) ([]gpuHolder, error) {
+ 	procs, err := os.ReadDir(procRoot)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error listing %q: %w", procRoot, err)
+ 	}
+-	var holders []string
++	var holders []gpuHolder
+ 	for _, p := range procs {
+ 		// Only the numeric entries of /proc are processes; the rest (self,
+ 		// sys, meminfo, ...) are kernel interfaces.
+@@ -263,7 +312,7 @@ func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, erro
+ 			// st_rdev, regardless of the node's name or location.
+ 			rdev := uint64(st.Rdev) //nolint:gosec,unconvert
+ 			if uint32(st.Mode)&unix.S_IFMT == unix.S_IFCHR && unix.Major(rdev) == major && unix.Minor(rdev) == minor {
+-				holders = append(holders, fmt.Sprintf("%s(%s)", p.Name(), processExeName(procRoot, p.Name())))
++				holders = append(holders, gpuHolder{pid: p.Name(), exe: processExeName(procRoot, p.Name())})
+ 				break
+ 			}
+ 		}
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go b/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
+index ae168241..87e6d6df 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
+@@ -34,7 +34,7 @@ func TestFindCharDeviceHolders(t *testing.T) {
+ 
+ 	exe, err := os.Executable()
+ 	require.NoError(t, err)
+-	self := fmt.Sprintf("%d(%s)", os.Getpid(), filepath.Base(exe))
++	self := gpuHolder{pid: fmt.Sprint(os.Getpid()), exe: filepath.Base(exe)}
+ 
+ 	tests := map[string]struct {
+ 		procRoot     string
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device_test.go b/cmd/gpu-kubelet-plugin/vfio-device_test.go
+index 5b65c672..0df47f77 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device_test.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device_test.go
+@@ -159,6 +159,44 @@ func TestUnbindDevice(t *testing.T) {
+ 	}
+ }
+ 
++func TestBlockingHolders(t *testing.T) {
++	dcgm := gpuHolder{pid: "10", exe: "dcgm-exporter"}
++	persistenced := gpuHolder{pid: "11", exe: "nvidia-persistenced"}
++	unknown := gpuHolder{pid: "12"}
++
++	tests := map[string]struct {
++		releasing []string
++		holders   []gpuHolder
++		want      []gpuHolder
++	}{
++		"no holders":                  {releasing: []string{"dcgm-exporter"}},
++		"nothing releases by default": {holders: []gpuHolder{dcgm}, want: []gpuHolder{dcgm}},
++		"only releasing holders":      {releasing: []string{"dcgm-exporter"}, holders: []gpuHolder{dcgm}},
++		"other holders still block": {
++			releasing: []string{"dcgm-exporter"},
++			holders:   []gpuHolder{dcgm, persistenced},
++			want:      []gpuHolder{persistenced},
++		},
++		"unreadable exe blocks": {
++			releasing: []string{""},
++			holders:   []gpuHolder{unknown},
++			want:      []gpuHolder{unknown},
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			vm := &VfioPciManager{releasingHolders: tc.releasing}
++			require.Equal(t, tc.want, vm.blockingHolders(tc.holders))
++		})
++	}
++}
++
++func TestSplitList(t *testing.T) {
++	require.Nil(t, splitList(""))
++	require.Equal(t, []string{"dcgm-exporter", "nv-hostengine"}, splitList(" dcgm-exporter,,nv-hostengine "))
++}
++
+ func TestTryChangeDriverWithTimeout(t *testing.T) {
+ 	vm := &VfioPciManager{
+ 		nvidiaEnabled: true,

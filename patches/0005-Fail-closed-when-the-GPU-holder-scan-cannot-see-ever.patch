@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Botond Lovasz <botilovasz@gmail.com>
+Date: Tue, 20 Oct 2026 23:47:48 +0200
+Subject: [PATCH 5/7] Fail closed when the GPU holder scan cannot see every
+ process
+
+The /proc scan is the only guard against unbinding a GPU that is still
+open, which hangs in the kernel. It skipped processes and fds it could not
+read, and trusted whatever /proc it was given, so a hardened host (an LSM
+denying the reads, or Talos workload isolation putting the plugin in a
+sandbox PID namespace without the host services) reported a busy GPU as
+free.
+
+Only fds and processes that disappear mid-scan are skipped now; any other
+error fails the prepare. WaitForGPUFree also requires procRoot to be the
+initial PID namespace, which has a fixed inode (PROC_PID_INIT_INO).
+---
+ cmd/gpu-kubelet-plugin/vfio-device.go         | 50 +++++++++++++++----
+ .../vfio-device_linux_test.go                 | 31 ++++++++++++
+ 2 files changed, 71 insertions(+), 10 deletions(-)
+
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device.go b/cmd/gpu-kubelet-plugin/vfio-device.go
+index d4b0011c..d7491770 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device.go
+@@ -47,6 +47,9 @@ const (
+ 	// The kubelet plugin mounts the host's /proc here when PassthroughSupport
+ 	// is enabled, so it lists every process in the host PID namespace.
+ 	procRoot = "/proc"
++	// The initial PID namespace has a fixed inode (PROC_PID_INIT_INO), so this
++	// is what /proc/1/ns/pid reads when procRoot shows every host process.
++	initPIDNamespace = "pid:[4026531836]"
+ 	// NV_MAJOR_DEVICE_NUMBER: /dev/nvidia<minor> is always char device 195:<minor>.
+ 	nvidiaDeviceMajor    = 195
+ 	gpuFreeCheckInterval = 1 * time.Second
+@@ -177,6 +180,12 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
+ 	if info.parent == nil {
+ 		return nil
+ 	}
++	// A /proc that does not show every host process (e.g. a sandboxed PID
++	// namespace) would report a busy GPU as free, and unbinding a busy GPU
++	// hangs in the kernel.
++	if err := checkHostPIDNamespace(procRoot); err != nil {
++		return fmt.Errorf("cannot check if gpu device %q is free: %w", info.PciBusID, err)
++	}
+ 	timeout := time.After(gpuFreeCheckTimeout)
+ 	ticker := time.NewTicker(gpuFreeCheckInterval)
+ 	defer ticker.Stop()
+@@ -189,9 +198,7 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
+ 		case <-ticker.C:
+ 			holders, scanErr := findCharDeviceHolders(procRoot, nvidiaDeviceMajor, uint32(info.parent.minor)) //nolint:gosec
+ 			if scanErr != nil {
+-				err = fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, scanErr)
+-				klog.V(6).Infof("%v", err)
+-				continue
++				return fmt.Errorf("unexpected error checking if gpu device %q is free: %w", info.PciBusID, scanErr)
+ 			}
+ 			if len(holders) == 0 {
+ 				return nil
+@@ -202,9 +209,23 @@ func (vm *VfioPciManager) WaitForGPUFree(ctx context.Context, info *VfioDeviceIn
+ 	}
+ }
+ 
++// checkHostPIDNamespace verifies that procRoot is the initial PID namespace's
++// procfs, i.e. that a scan of it sees every process on the host.
++func checkHostPIDNamespace(procRoot string) error {
++	ns, err := os.Readlink(filepath.Join(procRoot, "1", "ns", "pid"))
++	if err != nil {
++		return fmt.Errorf("error reading the PID namespace of %q: %w", procRoot, err)
++	}
++	if ns != initPIDNamespace {
++		return fmt.Errorf("%q shows PID namespace %s, not the host's %s: mount the host's /proc there", procRoot, ns, initPIDNamespace)
++	}
++	return nil
++}
++
+ // findCharDeviceHolders returns "<pid>(<exe>)" for every process under procRoot
+-// holding an open fd to the character device major:minor. Processes that exit
+-// or whose fds cannot be read mid-scan are skipped.
++// holding an open fd to the character device major:minor. Processes and fds
++// that disappear mid-scan are skipped; any other error fails the scan, since
++// a process it cannot inspect may be holding the device.
+ func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, error) {
+ 	procs, err := os.ReadDir(procRoot)
+ 	if err != nil {
+@@ -218,13 +239,14 @@ func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, erro
+ 			continue
+ 		}
+ 		// /proc/<pid>/fd holds one symlink per open fd. Listing it fails with
+-		// ENOENT for a process that exited mid-scan, and with EACCES for one
+-		// we may not inspect, which the privileged plugin does not expect;
+-		// either way there is nothing to check, so skip it.
++		// ENOENT (or ESRCH) for a process that exited mid-scan.
+ 		fdDir := filepath.Join(procRoot, p.Name(), "fd")
+ 		fds, err := os.ReadDir(fdDir)
+ 		if err != nil {
+-			continue
++			if isGoneErr(err) {
++				continue
++			}
++			return nil, fmt.Errorf("error listing open fds of process %s: %w", p.Name(), err)
+ 		}
+ 		for _, fd := range fds {
+ 			// Stat follows the fd symlink to the open file itself, so this
+@@ -232,7 +254,10 @@ func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, erro
+ 			// that does not exist in our mount namespace.
+ 			var st unix.Stat_t
+ 			if err := unix.Stat(filepath.Join(fdDir, fd.Name()), &st); err != nil {
+-				continue
++				if isGoneErr(err) {
++					continue
++				}
++				return nil, fmt.Errorf("error inspecting fd %s of process %s: %w", fd.Name(), p.Name(), err)
+ 			}
+ 			// A character device is identified by the major:minor packed into
+ 			// st_rdev, regardless of the node's name or location.
+@@ -246,6 +271,11 @@ func findCharDeviceHolders(procRoot string, major, minor uint32) ([]string, erro
+ 	return holders, nil
+ }
+ 
++// isGoneErr reports whether err means the process or fd went away mid-scan.
++func isGoneErr(err error) bool {
++	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ESRCH)
++}
++
+ // processExeName returns the basename of /proc/<pid>/exe. Unlike
+ // /proc/<pid>/comm it is not truncated to 15 bytes. It is empty when the link
+ // cannot be read, e.g. for a process that exited mid-scan.
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go b/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
+index ee122dd7..ae168241 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
+@@ -78,7 +78,38 @@ func TestFindCharDeviceHolders(t *testing.T) {
+ 	}
+ }
+ 
++func TestCheckHostPIDNamespace(t *testing.T) {
++	tests := map[string]struct {
++		ns      string
++		wantErr bool
++	}{
++		"initial pid namespace": {ns: initPIDNamespace},
++		"nested pid namespace":  {ns: "pid:[4026537832]", wantErr: true},
++		"no proc":               {wantErr: true},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			procRoot := t.TempDir()
++			if tc.ns != "" {
++				nsDir := filepath.Join(procRoot, "1", "ns")
++				require.NoError(t, os.MkdirAll(nsDir, 0o755))
++				require.NoError(t, os.Symlink(tc.ns, filepath.Join(nsDir, "pid")))
++			}
++			err := checkHostPIDNamespace(procRoot)
++			if tc.wantErr {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++		})
++	}
++}
++
+ func TestWaitForGPUFree(t *testing.T) {
++	if checkHostPIDNamespace("/proc") != nil {
++		t.Skip("not running in the initial PID namespace")
++	}
+ 	vm := &VfioPciManager{}
+ 	info := &VfioDeviceInfo{parent: &GpuInfo{minor: 4095}}
+ 

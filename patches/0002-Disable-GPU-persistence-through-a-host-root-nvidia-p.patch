@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: swibrow <15628653+swibrow@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 05:53:07 +0200
+Subject: [PATCH 2/7] Disable GPU persistence through a host-root
+ nvidia-persistenced
+
+disableGPUPersistenceMode only looks for the nvidia-persistenced socket under
+the driver root. On hosts whose driver root is not / but which run the daemon
+from the host (e.g. Talos: driver under /usr/local, socket under /run), the
+daemon is reported as not running and keeps its handle on the GPU, so the
+vfio-pci rebind cannot proceed. When the socket is absent under the driver
+root but present under the host root, disable persistence mode with the host
+driver's nvidia-smi run chrooted into the host root. This is best effort: on
+failure it logs and proceeds as before.
+
+Hosts whose persistenced socket is under the driver root take the unchanged
+path.
+
+Signed-off-by: swibrow <15628653+swibrow@users.noreply.github.com>
+(cherry picked from commit ce050107f65597e9be1c7be1251c26ec06a30e1d)
+---
+ cmd/gpu-kubelet-plugin/nvlib.go            | 10 ++++-
+ cmd/gpu-kubelet-plugin/vfio-device.go      | 51 ++++++++++++++++++++++
+ cmd/gpu-kubelet-plugin/vfio-device_test.go | 47 ++++++++++++++++++++
+ 3 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/cmd/gpu-kubelet-plugin/nvlib.go b/cmd/gpu-kubelet-plugin/nvlib.go
+index 63484a36..e9c9ff52 100644
+--- a/cmd/gpu-kubelet-plugin/nvlib.go
++++ b/cmd/gpu-kubelet-plugin/nvlib.go
+@@ -1535,10 +1535,16 @@ func setMax(m map[resourceapi.QualifiedName]resourceapi.DeviceCapacity, k resour
+ //
+ // Note: we `chroot` into the device root to properly run nvidia-smi.
+ func (l deviceLib) disableGPUPersistenceMode(pciAddress string) error {
++	return l.disableGPUPersistenceModeInRoot(pciAddress, l.devRoot, "nvidia-smi")
++}
++
++// disableGPUPersistenceModeInRoot runs `nvidia-smi -pm 0` chrooted into
++// chrootDir; see disableGPUPersistenceMode.
++func (l deviceLib) disableGPUPersistenceModeInRoot(pciAddress, chrootDir, nvidiaSMI string) error {
+ 	cmd := exec.Command(
+ 		"chroot",
+-		l.devRoot,
+-		"nvidia-smi",
++		chrootDir,
++		nvidiaSMI,
+ 		"-i",
+ 		pciAddress,
+ 		"-pm",
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device.go b/cmd/gpu-kubelet-plugin/vfio-device.go
+index 8ae2aa19..81af2849 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device.go
+@@ -32,6 +32,8 @@ import (
+ 
+ 	"golang.org/x/sys/unix"
+ 	"k8s.io/klog/v2"
++
++	"sigs.k8s.io/dra-driver-nvidia-gpu/internal/lookup/root"
+ )
+ 
+ const (
+@@ -465,6 +467,10 @@ func (vm *VfioPciManager) disableGPUPersistenceMode(pciAddress string) error {
+ 		if !os.IsNotExist(err) {
+ 			return fmt.Errorf("error checking if nvidia-persistenced is running: %w", err)
+ 		}
++		if vm.hostRootPersistencedRunning() {
++			vm.tryDisableGPUPersistenceModeFromHostRoot(pciAddress)
++			return nil
++		}
+ 		klog.V(4).Infof("nvidia-persistenced is not running; nothing to do...")
+ 		return nil
+ 	}
+@@ -476,6 +482,51 @@ func (vm *VfioPciManager) disableGPUPersistenceMode(pciAddress string) error {
+ 	return nil
+ }
+ 
++// Check if nvidia-persistenced's socket exists under the host root, for hosts
++// that run the daemon outside the driver root (e.g. Talos: driver under
++// /usr/local, socket under /run).
++func (vm *VfioPciManager) hostRootPersistencedRunning() bool {
++	socket := filepath.Join(vm.nvlib.hostRoot, nvidiaPersistencedSocketPath)
++	klog.V(4).Infof("Checking if nvidia-persistenced is running under the host root: %s", socket)
++	_, err := os.Stat(socket)
++	if err != nil && !os.IsNotExist(err) {
++		klog.V(4).Infof("Error checking nvidia-persistenced socket %s: %v", socket, err)
++	}
++	return err == nil
++}
++
++// Disable persistence mode with the host driver's nvidia-smi, chrooted into the
++// host root so it reaches the host's nvidia-persistenced. Best effort: on
++// failure, log and proceed as when the daemon is not detected.
++func (vm *VfioPciManager) tryDisableGPUPersistenceModeFromHostRoot(pciAddress string) {
++	nvidiaSMI, err := hostRootBinaryPath(vm.nvlib.hostRoot, vm.hostDriverRoot, "nvidia-smi")
++	if err != nil {
++		klog.Warningf("nvidia-persistenced is running on the host but persistence mode for GPU %q cannot be disabled: %v", pciAddress, err)
++		return
++	}
++	if err := vm.nvlib.disableGPUPersistenceModeInRoot(pciAddress, vm.nvlib.hostRoot, nvidiaSMI); err != nil {
++		klog.Warningf("Error disabling persistence mode for GPU %q from the host root: %v", pciAddress, err)
++	}
++}
++
++// Locate a driver binary under hostRoot/hostDriverRoot and return its path
++// relative to hostRoot, for running it chrooted into hostRoot.
++func hostRootBinaryPath(hostRoot, hostDriverRoot, name string) (string, error) {
++	path, err := root.New(root.WithDriverRoot(filepath.Join(hostRoot, hostDriverRoot))).BinaryPath(name)
++	if err != nil {
++		return "", err
++	}
++	resolvedHostRoot, err := filepath.EvalSymlinks(hostRoot)
++	if err != nil {
++		return "", fmt.Errorf("error resolving host root %q: %w", hostRoot, err)
++	}
++	rel, err := filepath.Rel(resolvedHostRoot, path)
++	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
++		return "", fmt.Errorf("%q resolves to %q, outside the host root %q", name, path, hostRoot)
++	}
++	return "/" + rel, nil
++}
++
+ // Check if the expected kernel module is loaded.
+ func (vm *VfioPciManager) checkKernelModuleLoaded(module string) (bool, error) {
+ 	f, err := os.Stat(filepath.Join(vm.nvlib.hostRoot, sysModulePath, module))
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device_test.go b/cmd/gpu-kubelet-plugin/vfio-device_test.go
+index 811ec753..7485698b 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device_test.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device_test.go
+@@ -53,6 +53,53 @@ func TestGetDriver(t *testing.T) {
+ 	})
+ }
+ 
++func TestHostRootPersistencedRunning(t *testing.T) {
++	t.Run("socket absent", func(t *testing.T) {
++		vm := &VfioPciManager{nvlib: &deviceLib{hostRoot: t.TempDir()}}
++		require.False(t, vm.hostRootPersistencedRunning())
++	})
++
++	t.Run("socket present", func(t *testing.T) {
++		hostRoot := t.TempDir()
++		socket := filepath.Join(hostRoot, nvidiaPersistencedSocketPath)
++		require.NoError(t, os.MkdirAll(filepath.Dir(socket), 0o755))
++		require.NoError(t, os.WriteFile(socket, nil, 0o600))
++
++		vm := &VfioPciManager{nvlib: &deviceLib{hostRoot: hostRoot}}
++		require.True(t, vm.hostRootPersistencedRunning())
++	})
++}
++
++func TestHostRootBinaryPath(t *testing.T) {
++	t.Run("returns path relative to the host root", func(t *testing.T) {
++		hostRoot := t.TempDir()
++		binary := filepath.Join(hostRoot, "usr/local/bin/nvidia-smi")
++		require.NoError(t, os.MkdirAll(filepath.Dir(binary), 0o755))
++		require.NoError(t, os.WriteFile(binary, nil, 0o755))
++
++		path, err := hostRootBinaryPath(hostRoot, "/usr/local", "nvidia-smi")
++		require.NoError(t, err)
++		require.Equal(t, "/usr/local/bin/nvidia-smi", path)
++	})
++
++	t.Run("binary missing", func(t *testing.T) {
++		_, err := hostRootBinaryPath(t.TempDir(), "/usr/local", "nvidia-smi")
++		require.Error(t, err)
++	})
++
++	t.Run("binary resolves outside the host root", func(t *testing.T) {
++		hostRoot, outside := t.TempDir(), t.TempDir()
++		target := filepath.Join(outside, "nvidia-smi")
++		require.NoError(t, os.WriteFile(target, nil, 0o755))
++		link := filepath.Join(hostRoot, "usr/bin/nvidia-smi")
++		require.NoError(t, os.MkdirAll(filepath.Dir(link), 0o755))
++		require.NoError(t, os.Symlink(target, link))
++
++		_, err := hostRootBinaryPath(hostRoot, "/", "nvidia-smi")
++		require.Error(t, err)
++	})
++}
++
+ func TestTryChangeDriverWithTimeout(t *testing.T) {
+ 	vm := &VfioPciManager{
+ 		nvidiaEnabled: true,

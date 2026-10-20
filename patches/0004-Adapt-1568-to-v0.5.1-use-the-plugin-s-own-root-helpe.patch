@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Botond Lovasz <botilovasz@gmail.com>
+Date: Tue, 20 Oct 2026 23:46:39 +0200
+Subject: [PATCH 4/7] Adapt #1568 to v0.5.1: use the plugin's own root helper
+
+v0.5.1 predates internal/lookup/root, which the PR head (based on main)
+imports. Drop this commit once the base release ships that package.
+---
+ cmd/gpu-kubelet-plugin/vfio-device.go | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device.go b/cmd/gpu-kubelet-plugin/vfio-device.go
+index bcc2d848..d4b0011c 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device.go
+@@ -32,8 +32,6 @@ import (
+ 
+ 	"golang.org/x/sys/unix"
+ 	"k8s.io/klog/v2"
+-
+-	"sigs.k8s.io/dra-driver-nvidia-gpu/internal/lookup/root"
+ )
+ 
+ const (
+@@ -536,7 +534,7 @@ func (vm *VfioPciManager) tryDisableGPUPersistenceModeFromHostRoot(pciAddress st
+ // Locate a driver binary under hostRoot/hostDriverRoot and return its path
+ // relative to hostRoot, for running it chrooted into hostRoot.
+ func hostRootBinaryPath(hostRoot, hostDriverRoot, name string) (string, error) {
+-	path, err := root.New(root.WithDriverRoot(filepath.Join(hostRoot, hostDriverRoot))).BinaryPath(name)
++	path, err := root(filepath.Join(hostRoot, hostDriverRoot)).getNvidiaSMIPath()
+ 	if err != nil {
+ 		return "", err
+ 	}

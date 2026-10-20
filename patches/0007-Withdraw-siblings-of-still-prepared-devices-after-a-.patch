@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Botond Lovasz <botilovasz@gmail.com>
+Date: Tue, 20 Oct 2026 23:49:51 +0200
+Subject: [PATCH 7/7] Withdraw siblings of still-prepared devices after a
+ plugin restart
+
+Prepare() withdraws the other device type of a prepared GPU (its vfio twin
+while a container holds the GPU, and vice versa), but allocatables are
+rediscovered from scratch on startup and the withdrawal is never
+re-applied: Prepare() short-circuits for claims already PrepareCompleted.
+After any plugin restart both types were advertised again, so the vfio twin
+of a GPU in use could be allocated to a VM.
+
+Re-apply the withdrawal for checkpointed PrepareCompleted claims when the
+checkpoint survives startup (same boot).
+---
+ cmd/gpu-kubelet-plugin/device_state.go      | 25 +++++++++++++
+ cmd/gpu-kubelet-plugin/device_state_test.go | 40 +++++++++++++++++++++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/cmd/gpu-kubelet-plugin/device_state.go b/cmd/gpu-kubelet-plugin/device_state.go
+index 30bac592..c887dcc2 100644
+--- a/cmd/gpu-kubelet-plugin/device_state.go
++++ b/cmd/gpu-kubelet-plugin/device_state.go
+@@ -269,9 +269,11 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
+ 				if err != nil {
+ 					return nil, fmt.Errorf("unable to update checkpoint: %w", err)
+ 				}
++				state.withdrawPreparedSiblings(cp)
+ 				syncPreparedDevicesGaugeFromCheckpoint(config.flags.nodeName, cp)
+ 				return state, nil
+ 			} else if storedBootID == currentBootID {
++				state.withdrawPreparedSiblings(cp)
+ 				syncPreparedDevicesGaugeFromCheckpoint(config.flags.nodeName, cp)
+ 				return state, nil
+ 			} else {
+@@ -289,6 +291,29 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
+ 	return state, nil
+ }
+ 
++// withdrawPreparedSiblings re-applies, after a plugin restart, the sibling
++// withdrawal Prepare() did for claims that are still prepared: allocatables
++// are rediscovered from scratch at startup, so otherwise the vfio twin of a
++// GPU in use by a container (or vice versa) is advertised again.
++func (s *DeviceState) withdrawPreparedSiblings(cp *Checkpoint) {
++	// TODO: Remove this once partitionable device support is introduced for vfio devices.
++	if !featuregates.Enabled(featuregates.PassthroughSupport) {
++		return
++	}
++	for _, pc := range cp.V2.PreparedClaims {
++		if pc.CheckpointState != ClaimCheckpointStatePrepareCompleted {
++			continue
++		}
++		for _, device := range pc.PreparedDevices.GetDevices() {
++			allocatableDevice := s.perGPUAllocatable.GetAllocatableDevice(device.DeviceName)
++			if allocatableDevice == nil {
++				continue
++			}
++			s.perGPUAllocatable.RemoveSiblingDevices(allocatableDevice)
++		}
++	}
++}
++
+ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceClaim) ([]kubeletplugin.Device, error) {
+ 
+ 	if err := s.validateAdminAccessRequest(claim); err != nil {
+diff --git a/cmd/gpu-kubelet-plugin/device_state_test.go b/cmd/gpu-kubelet-plugin/device_state_test.go
+index 4474b6c9..77ac264e 100644
+--- a/cmd/gpu-kubelet-plugin/device_state_test.go
++++ b/cmd/gpu-kubelet-plugin/device_state_test.go
+@@ -774,3 +774,43 @@ func TestRollbackPartiallyPreparedMIGDevicesIgnoresOtherDrivers(t *testing.T) {
+ 		require.Zero(t, nvmllib.handleLookups, "a device held by a completed claim must not reach MIG teardown")
+ 	})
+ }
++
++func TestWithdrawPreparedSiblings(t *testing.T) {
++	original := featuregates.Enabled(featuregates.PassthroughSupport)
++	require.NoError(t, featuregates.FeatureGates().SetFromMap(
++		map[string]bool{string(featuregates.PassthroughSupport): true}))
++	t.Cleanup(func() {
++		require.NoError(t, featuregates.FeatureGates().SetFromMap(
++			map[string]bool{string(featuregates.PassthroughSupport): original}))
++	})
++
++	pci := "0000:02:00.0"
++	gpu := &AllocatableDevice{Gpu: &GpuInfo{minor: 1, UUID: "GPU-1", pciBusID: pci}}
++	vfio := &AllocatableDevice{Vfio: &VfioDeviceInfo{index: 1, UUID: "VF-1", PciBusID: pci}}
++	perGPU := newPerGPU()
++	require.NoError(t, perGPU.AddAllocatableDevice(gpu))
++	require.NoError(t, perGPU.AddAllocatableDevice(vfio))
++
++	claimOnGPU := func(state ClaimCheckpointState) PreparedClaimV2 {
++		return PreparedClaimV2{
++			CheckpointState: state,
++			PreparedDevices: PreparedDevices{{Devices: PreparedDeviceList{{
++				Gpu: &PreparedGpu{Info: gpu.Gpu, Device: &CheckpointedDevice{DeviceName: "gpu-1"}},
++			}}}},
++		}
++	}
++	cp := &Checkpoint{V2: &CheckpointV2{PreparedClaims: PreparedClaimsByUIDV2{
++		"started": claimOnGPU(ClaimCheckpointStatePrepareStarted),
++	}}}
++	state := &DeviceState{perGPUAllocatable: perGPU}
++
++	// A partially prepared claim withdraws nothing.
++	state.withdrawPreparedSiblings(cp)
++	require.Contains(t, perGPU.GetAllDevices(), "gpu-vfio-1")
++
++	cp.V2.PreparedClaims["completed"] = claimOnGPU(ClaimCheckpointStatePrepareCompleted)
++	state.withdrawPreparedSiblings(cp)
++	all := perGPU.GetAllDevices()
++	require.Contains(t, all, "gpu-1")
++	require.NotContains(t, all, "gpu-vfio-1")
++}

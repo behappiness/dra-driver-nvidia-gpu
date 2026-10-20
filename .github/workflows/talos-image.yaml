@@ -1,0 +1,163 @@
+# Builds ghcr.io/<owner>/dra-driver-nvidia-gpu:<base>-talos.<tree>: the upstream
+# release in BASE plus patches/, unit-tested. The daily run moves to the newest
+# upstream release once the queue applies and tests clean, commits the rebased
+# queue and opens an issue naming the new image; if it does not apply, the issue
+# says so instead. Patches that upstream has merged apply empty and are dropped.
+name: talos-image
+
+on:
+  push:
+    branches: [talos]
+    paths: [BASE, "patches/**", ".github/workflows/talos-image.yaml"]
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Upstream tag to build on (default BASE)
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+concurrency:
+  group: talos-image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: kubernetes-sigs/dra-driver-nvidia-gpu
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dra-driver-nvidia-gpu
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: queue
+
+      - name: Pick the upstream base
+        id: base
+        env:
+          INPUT_BASE: ${{ inputs.base }}
+        run: |
+          current=$(tr -d '[:space:]' < queue/BASE)
+          target=$current
+          if [ -n "$INPUT_BASE" ]; then
+            target=$INPUT_BASE
+          elif [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            target=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "Building on $target (queue is on $current)"
+
+      - name: Apply the patch queue
+        id: apply
+        env:
+          TARGET: ${{ steps.base.outputs.target }}
+        run: |
+          git clone --quiet --filter=blob:none --branch "$TARGET" "https://github.com/$UPSTREAM.git" src
+          cd src
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git am --3way --empty=drop ../queue/patches/*.patch > ../am.log 2>&1; then
+            cat ../am.log
+            echo "failure=the patch queue does not apply to $TARGET" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          cat ../am.log
+          # Patches that applied empty (merged upstream) are gone from the log.
+          git log --format=%s "$TARGET..HEAD" > ../applied.txt
+          : > ../dropped.txt
+          for p in ../queue/patches/*.patch; do
+            # Long subjects are folded onto continuation lines starting with a space.
+            subject=$(awk '/^Subject: /{s=$0; sub(/^Subject: \[PATCH[^]]*\] /, "", s); while ((getline l) > 0 && l ~ /^ /) s = s l; print s; exit}' "$p")
+            grep -qxF "$subject" ../applied.txt || echo "$subject" >> ../dropped.txt
+          done
+          echo "tree=$(git rev-parse --short=10 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+          echo "go=$(./hack/golang-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6
+        with:
+          go-version: ${{ steps.apply.outputs.go }}
+          cache: false
+
+      - name: Unit tests
+        id: test
+        working-directory: src
+        run: |
+          echo "failure=unit tests fail on ${{ steps.base.outputs.target }}" >> "$GITHUB_OUTPUT"
+          go test -race ./...
+          echo "failure=" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the image
+        id: image
+        working-directory: src
+        env:
+          TAG: ${{ steps.base.outputs.target }}-talos.${{ steps.apply.outputs.tree }}
+        run: |
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if docker buildx imagetools inspect "$IMAGE:$TAG" > /dev/null 2>&1; then
+            echo "$IMAGE:$TAG already exists"
+            exit 0
+          fi
+          echo "failure=the image build fails on ${{ steps.base.outputs.target }}" >> "$GITHUB_OUTPUT"
+          docker buildx create --use --name talos > /dev/null
+          # BUILD_MULTI_ARCH_IMAGES only switches on push; the platform is pinned.
+          make -f deployments/container/Makefile build \
+            IMAGE_NAME="$IMAGE" IMAGE_TAG="$TAG" \
+            BUILD_MULTI_ARCH_IMAGES=true PUSH_ON_BUILD=true \
+            DOCKER_BUILD_PLATFORM_OPTIONS=--platform=linux/amd64 \
+            DOCKER_BUILD_OPTIONS="--output=type=image,push=true --provenance=false --sbom=false --label org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY"
+          docker buildx imagetools create -t "$IMAGE:${{ steps.base.outputs.target }}-talos" "$IMAGE:$TAG"
+          echo "failure=" >> "$GITHUB_OUTPUT"
+
+      - name: Move the queue to the new base
+        if: steps.base.outputs.target != steps.base.outputs.current
+        env:
+          TARGET: ${{ steps.base.outputs.target }}
+          CURRENT: ${{ steps.base.outputs.current }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          cd queue
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm --quiet patches/*.patch
+          git -C ../src format-patch --quiet --zero-commit --no-signature -o "$PWD/patches" "$TARGET..HEAD"
+          echo "$TARGET" > BASE
+          git add BASE patches
+          git commit --quiet -m "Rebase the queue onto $TARGET" -m "$(sed 's/^/Dropped (merged upstream): /' ../dropped.txt)"
+          git push --quiet origin HEAD:talos
+          {
+            echo "The patch queue moved from \`$CURRENT\` to upstream \`$TARGET\` and passed the unit tests."
+            echo
+            echo "New image: \`$IMAGE:$TAG\`"
+            echo
+            echo "To roll it out, bump the chart to the matching release and set \`image.tag\` in the homelab's \`k8s/dra-driver-nvidia-gpu/values.yaml\`, then re-test a vfio claim."
+            if [ -s ../dropped.txt ]; then
+              echo
+              echo "Dropped because upstream now carries them:"
+              sed 's/^/- /' ../dropped.txt
+            fi
+          } > ../issue.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "New Talos image on $TARGET: $TAG" --body-file ../issue.md
+
+      - name: Report a failure
+        if: failure()
+        env:
+          REASON: ${{ steps.apply.outputs.failure || steps.test.outputs.failure || steps.image.outputs.failure || 'the workflow failed' }}
+          TARGET: ${{ steps.base.outputs.target }}
+        run: |
+          title="Talos image: $REASON"
+          body="Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
