@@ -15,9 +15,9 @@ Only fds and processes that disappear mid-scan are skipped now; any other
 error fails the prepare. WaitForGPUFree also requires procRoot to be the
 initial PID namespace, which has a fixed inode (PROC_PID_INIT_INO).
 ---
- cmd/gpu-kubelet-plugin/vfio-device.go         | 50 +++++++++++++++----
- .../vfio-device_linux_test.go                 | 31 ++++++++++++
- 2 files changed, 71 insertions(+), 10 deletions(-)
+ cmd/gpu-kubelet-plugin/vfio-device.go         | 50 ++++++++---
+ .../vfio-device_linux_test.go                 | 83 ++++++++++++-------
+ 2 files changed, 91 insertions(+), 42 deletions(-)
 
 diff --git a/cmd/gpu-kubelet-plugin/vfio-device.go b/cmd/gpu-kubelet-plugin/vfio-device.go
 index d4b0011c..d7491770 100644
@@ -127,25 +127,100 @@ index d4b0011c..d7491770 100644
  // /proc/<pid>/comm it is not truncated to 15 bytes. It is empty when the link
  // cannot be read, e.g. for a process that exited mid-scan.
 diff --git a/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go b/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
-index ee122dd7..ae168241 100644
+index ee122dd7..a6c93177 100644
 --- a/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
 +++ b/cmd/gpu-kubelet-plugin/vfio-device_linux_test.go
-@@ -78,7 +78,38 @@ func TestFindCharDeviceHolders(t *testing.T) {
- 	}
- }
+@@ -18,9 +18,9 @@ package main
  
+ import (
+ 	"context"
+-	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
+ 	"testing"
+ 	"time"
+ 
+@@ -28,57 +28,76 @@ import (
+ )
+ 
+ func TestFindCharDeviceHolders(t *testing.T) {
+-	f, err := os.Open("/dev/null")
++	// A procfs-like tree: an exe link and fd links per pid. Stat follows the
++	// fd links, so /dev/null stands in for a held GPU node (char device 1:3).
++	procRoot := t.TempDir()
++	addProc := func(pid, exe string, fds ...string) string {
++		dir := filepath.Join(procRoot, pid)
++		require.NoError(t, os.MkdirAll(filepath.Join(dir, "fd"), 0o755))
++		require.NoError(t, os.Symlink(exe, filepath.Join(dir, "exe")))
++		for i, target := range fds {
++			require.NoError(t, os.Symlink(target, filepath.Join(dir, "fd", strconv.Itoa(i))))
++		}
++		return dir
++	}
++	addProc("100", "/usr/bin/holder", "/dev/null")
++	addProc("101", "/usr/bin/other", "/dev/zero", "/closed-mid-scan")
++	require.NoError(t, os.MkdirAll(filepath.Join(procRoot, "102"), 0o755)) // exited mid-scan
++	require.NoError(t, os.MkdirAll(filepath.Join(procRoot, "self"), 0o755)) // not a process
++
++	holders, err := findCharDeviceHolders(procRoot, 1, 3)
+ 	require.NoError(t, err)
+-	defer f.Close()
++	require.Equal(t, []string{"100(holder)"}, holders)
+ 
+-	exe, err := os.Executable()
++	holders, err = findCharDeviceHolders(procRoot, nvidiaDeviceMajor, 4095)
+ 	require.NoError(t, err)
+-	self := fmt.Sprintf("%d(%s)", os.Getpid(), filepath.Base(exe))
++	require.Empty(t, holders)
++
++	_, err = findCharDeviceHolders(filepath.Join(procRoot, "missing"), 1, 3)
++	require.Error(t, err)
+ 
++	if os.Geteuid() != 0 {
++		// A process whose fds cannot be read fails the scan: it may hold the GPU.
++		fdDir := filepath.Join(addProc("103", "/usr/bin/hidden"), "fd")
++		require.NoError(t, os.Chmod(fdDir, 0))
++		t.Cleanup(func() { _ = os.Chmod(fdDir, 0o755) })
++		_, err = findCharDeviceHolders(procRoot, 1, 3)
++		require.Error(t, err)
++	}
++}
++
 +func TestCheckHostPIDNamespace(t *testing.T) {
-+	tests := map[string]struct {
+ 	tests := map[string]struct {
+-		procRoot     string
+-		major, minor uint32
+-		wantSelf     bool
+-		wantErr      bool
 +		ns      string
 +		wantErr bool
-+	}{
+ 	}{
+-		"device held by this process": {
+-			procRoot: "/proc",
+-			major:    1,
+-			minor:    3,
+-			wantSelf: true,
+-		},
+-		"device not held by this process": {
+-			procRoot: "/proc",
+-			major:    nvidiaDeviceMajor,
+-			minor:    4095,
+-		},
+-		"missing proc root": {
+-			procRoot: filepath.Join(t.TempDir(), "missing"),
+-			major:    1,
+-			minor:    3,
+-			wantErr:  true,
+-		},
 +		"initial pid namespace": {ns: initPIDNamespace},
 +		"nested pid namespace":  {ns: "pid:[4026537832]", wantErr: true},
 +		"no proc":               {wantErr: true},
-+	}
-+
-+	for name, tc := range tests {
-+		t.Run(name, func(t *testing.T) {
+ 	}
+ 
+ 	for name, tc := range tests {
+ 		t.Run(name, func(t *testing.T) {
+-			holders, err := findCharDeviceHolders(tc.procRoot, tc.major, tc.minor)
 +			procRoot := t.TempDir()
 +			if tc.ns != "" {
 +				nsDir := filepath.Join(procRoot, "1", "ns")
@@ -153,15 +228,20 @@ index ee122dd7..ae168241 100644
 +				require.NoError(t, os.Symlink(tc.ns, filepath.Join(nsDir, "pid")))
 +			}
 +			err := checkHostPIDNamespace(procRoot)
-+			if tc.wantErr {
-+				require.Error(t, err)
-+				return
-+			}
-+			require.NoError(t, err)
-+		})
-+	}
-+}
-+
+ 			if tc.wantErr {
+ 				require.Error(t, err)
+ 				return
+ 			}
+ 			require.NoError(t, err)
+-			if tc.wantSelf {
+-				require.Contains(t, holders, self)
+-			} else {
+-				require.NotContains(t, holders, self)
+-			}
+ 		})
+ 	}
+ }
+ 
  func TestWaitForGPUFree(t *testing.T) {
 +	if checkHostPIDNamespace("/proc") != nil {
 +		t.Skip("not running in the initial PID namespace")
