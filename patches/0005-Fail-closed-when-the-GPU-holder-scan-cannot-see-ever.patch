@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Botond Lovasz <botilovasz@gmail.com>
 Date: Tue, 20 Oct 2026 23:47:48 +0200
-Subject: [PATCH 5/7] Fail closed when the GPU holder scan cannot see every
+Subject: [PATCH 5/8] Fail closed when the GPU holder scan cannot see every
  process
 
 The /proc scan is the only guard against unbinding a GPU that is still

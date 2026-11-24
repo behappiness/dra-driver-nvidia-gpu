@@ -23,6 +23,7 @@ one source. `<base>-talos` is a moving alias to the latest build.
 | 0005 | The holder scan fails closed: permission errors, or a `/proc` that is not the initial PID namespace (e.g. Talos workload isolation), abort the switch instead of reporting "free". Unbinding a busy GPU hangs in the kernel. | not yet |
 | 0006 | `--vfio-unbind-releasing-holders`: named clients that release the GPU when it is unbound do not block the switch. This is meant for dcgm-exporter with its bind/unbind watch (driver 590+, DCGM 4.5+). Empty by default. | not yet |
 | 0007 | After a plugin restart, the plugin again withdraws the sibling of a still-prepared device. Before this, the vfio twin of a GPU in use was advertised again. | not yet |
+| 0008 | `--vfio-switch-hooks-configmap`: shell scripts from a ConfigMap in the plugin's namespace run on every driver switch, `unbound.<name>` with no driver bound and `bound.<name>` after the target is bound, with `PCI_ADDRESS` and `DRIVER` set; a failing hook fails the switch. For host-specific steps such as a secondary bus reset (FLR can leave an RTX 3090's firmware unbooted, RmInitAdapter 0x62:0x65). The plugin's service account needs `get` on that ConfigMap. Empty by default. | not yet |
 
 ## How it stays current
 
@@ -48,4 +49,6 @@ kubeletPlugin:
       env:
         - name: VFIO_UNBIND_RELEASING_HOLDERS
           value: dcgm-exporter
+        - name: VFIO_SWITCH_HOOKS_CONFIGMAP
+          value: vfio-switch-hooks
 ```

@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Botond Lovasz <botilovasz@gmail.com>
+Date: Tue, 24 Nov 2026 15:51:31 +0100
+Subject: [PATCH 8/8] Run ConfigMap hooks around GPU driver switches
+
+--vfio-switch-hooks-configmap names a ConfigMap in the plugin's namespace.
+On every driver switch, its entries "unbound.<name>" run with no driver
+bound and "bound.<name>" after the target driver is bound, in key order,
+as shell scripts with PCI_ADDRESS and DRIVER (the target) set. A failing
+hook fails the switch. Empty (the default): no hooks.
+
+This keeps host-specific steps out of the driver. On RTX 3090s, FLR
+sometimes leaves the card's firmware unbooted (RmInitAdapter 0x62:0x65);
+a secondary bus reset from the "unbound" stage recovers it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmd/gpu-kubelet-plugin/device_state.go        |  6 ++
+ cmd/gpu-kubelet-plugin/main.go                |  7 ++
+ cmd/gpu-kubelet-plugin/vfio-device.go         |  8 +-
+ cmd/gpu-kubelet-plugin/vfio-hooks.go          | 82 +++++++++++++++++
+ .../vfio-hooks_linux_test.go                  | 89 +++++++++++++++++++
+ 5 files changed, 191 insertions(+), 1 deletion(-)
+ create mode 100644 cmd/gpu-kubelet-plugin/vfio-hooks.go
+ create mode 100644 cmd/gpu-kubelet-plugin/vfio-hooks_linux_test.go
+
+diff --git a/cmd/gpu-kubelet-plugin/device_state.go b/cmd/gpu-kubelet-plugin/device_state.go
+index c887dcc2..cfde01dd 100644
+--- a/cmd/gpu-kubelet-plugin/device_state.go
++++ b/cmd/gpu-kubelet-plugin/device_state.go
+@@ -201,6 +201,12 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
+ 			return nil, fmt.Errorf("unable to create vfio pci manager: %w", err)
+ 		}
+ 		vfioPciManager.releasingHolders = splitList(config.flags.vfioUnbindReleasingHolders)
++		if name := config.flags.vfioSwitchHooksConfigMap; name != "" {
++			vfioPciManager.hooks = &switchHooks{
++				configMaps: config.clientsets.Core.CoreV1().ConfigMaps(config.flags.namespace),
++				name:       name,
++			}
++		}
+ 	}
+ 
+ 	fmManager, err := newFabricManager(nvdevlib, containerDriverRoot)
+diff --git a/cmd/gpu-kubelet-plugin/main.go b/cmd/gpu-kubelet-plugin/main.go
+index aa8f7081..4aaabc10 100644
+--- a/cmd/gpu-kubelet-plugin/main.go
++++ b/cmd/gpu-kubelet-plugin/main.go
+@@ -69,6 +69,7 @@ type Flags struct {
+ 	additionalXidsToIgnore        string
+ 	consumableShares              string
+ 	vfioUnbindReleasingHolders    string
++	vfioSwitchHooksConfigMap      string
+ }
+ 
+ type Config struct {
+@@ -224,6 +225,12 @@ func newApp() *cli.App {
+ 			Destination: &flags.vfioUnbindReleasingHolders,
+ 			EnvVars:     []string{"VFIO_UNBIND_RELEASING_HOLDERS"},
+ 		},
++		&cli.StringFlag{
++			Name:        "vfio-switch-hooks-configmap",
++			Usage:       "The name of a ConfigMap in the plugin's namespace whose entries \"unbound.<name>\" and \"bound.<name>\" are shell scripts run, in key order, on every GPU driver switch: with no driver bound, and after the target driver is bound. PCI_ADDRESS and DRIVER (the target) are set. A failing hook fails the switch. Empty: no hooks.",
++			Destination: &flags.vfioSwitchHooksConfigMap,
++			EnvVars:     []string{"VFIO_SWITCH_HOOKS_CONFIGMAP"},
++		},
+ 	}
+ 	cliFlags = append(cliFlags, flags.kubeClientConfig.Flags()...)
+ 	cliFlags = append(cliFlags, featureGateConfig.Flags()...)
+diff --git a/cmd/gpu-kubelet-plugin/vfio-device.go b/cmd/gpu-kubelet-plugin/vfio-device.go
+index a67d1ee5..d637d0fe 100644
+--- a/cmd/gpu-kubelet-plugin/vfio-device.go
++++ b/cmd/gpu-kubelet-plugin/vfio-device.go
+@@ -71,6 +71,8 @@ type VfioPciManager struct {
+ 	// from the nvidia driver, so they do not block a switch to vfio (e.g.
+ 	// dcgm-exporter with its bind/unbind watch).
+ 	releasingHolders []string
++	// nil when no hook ConfigMap is configured.
++	hooks *switchHooks
+ 
+ 	inflightDriverSwitches map[string]struct{}
+ }
+@@ -467,6 +469,10 @@ func (vm *VfioPciManager) changeDriver(pciAddress, driver string) error {
+ 		}
+ 	}
+ 
++	if err := vm.hooks.run(hookStageUnbound, pciAddress, driver); err != nil {
++		return err
++	}
++
+ 	err = vm.nvlib.nvpasst.BindToDriver(pciAddress, driver)
+ 	if err != nil {
+ 		return fmt.Errorf("error binding GPU %q to driver %q: %w", pciAddress, driver, err)
+@@ -480,7 +486,7 @@ func (vm *VfioPciManager) changeDriver(pciAddress, driver string) error {
+ 			return fmt.Errorf("error binding auxiliary devices of GPU %q to vfio: %w", pciAddress, err)
+ 		}
+ 	}
+-	return nil
++	return vm.hooks.run(hookStageBound, pciAddress, driver)
+ }
+ 
+ // Unbind only the GPU function. nvpassthrough.Unbind also unbinds the graphics
+diff --git a/cmd/gpu-kubelet-plugin/vfio-hooks.go b/cmd/gpu-kubelet-plugin/vfio-hooks.go
+new file mode 100644
+index 00000000..115a5fc4
+--- /dev/null
++++ b/cmd/gpu-kubelet-plugin/vfio-hooks.go
+@@ -0,0 +1,82 @@
++/*
++Copyright The Kubernetes Authors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package main
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"slices"
++	"strings"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/klog/v2"
++)
++
++// Stages of a GPU driver switch at which hooks run.
++const (
++	// The GPU has no driver; the target driver binds next.
++	hookStageUnbound = "unbound"
++	// The target driver is bound (on vfio, the auxiliary function too).
++	hookStageBound = "bound"
++)
++
++type configMapGetter interface {
++	Get(ctx context.Context, name string, opts metav1.GetOptions) (*corev1.ConfigMap, error)
++}
++
++// switchHooks runs host-specific steps around a driver switch, such as a bus
++// reset or a power limit. They are shell scripts in a ConfigMap, read at every
++// switch: the entries named "<stage>.<name>", in key order. A failing hook
++// fails the switch.
++type switchHooks struct {
++	configMaps configMapGetter
++	name       string
++}
++
++func (h *switchHooks) run(stage, pciAddress, driver string) error {
++	if h == nil {
++		return nil
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), driverChangeTimeout)
++	defer cancel()
++
++	cm, err := h.configMaps.Get(ctx, h.name, metav1.GetOptions{})
++	if err != nil {
++		return fmt.Errorf("error getting hook ConfigMap %q: %w", h.name, err)
++	}
++	var keys []string
++	for key := range cm.Data {
++		if strings.HasPrefix(key, stage+".") {
++			keys = append(keys, key)
++		}
++	}
++	slices.Sort(keys)
++
++	for _, key := range keys {
++		cmd := exec.CommandContext(ctx, "sh", "-c", cm.Data[key])
++		cmd.Env = append(os.Environ(), "PCI_ADDRESS="+pciAddress, "DRIVER="+driver)
++		out, err := cmd.CombinedOutput()
++		klog.Infof("Hook %q for GPU %q (driver %q): %s", key, pciAddress, driver, strings.TrimSpace(string(out)))
++		if err != nil {
++			return fmt.Errorf("hook %q for GPU %q failed: %w", key, pciAddress, err)
++		}
++	}
++	return nil
++}
+diff --git a/cmd/gpu-kubelet-plugin/vfio-hooks_linux_test.go b/cmd/gpu-kubelet-plugin/vfio-hooks_linux_test.go
+new file mode 100644
+index 00000000..f1477c57
+--- /dev/null
++++ b/cmd/gpu-kubelet-plugin/vfio-hooks_linux_test.go
+@@ -0,0 +1,89 @@
++/*
++Copyright The Kubernetes Authors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package main
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++)
++
++type fakeConfigMaps map[string]*corev1.ConfigMap
++
++func (f fakeConfigMaps) Get(_ context.Context, name string, _ metav1.GetOptions) (*corev1.ConfigMap, error) {
++	if cm, ok := f[name]; ok {
++		return cm, nil
++	}
++	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "configmaps"}, name)
++}
++
++func TestSwitchHooks(t *testing.T) {
++	log := filepath.Join(t.TempDir(), "log")
++	record := func(tag string) string {
++		return `echo "` + tag + ` $PCI_ADDRESS $DRIVER" >> ` + log
++	}
++	hooks := func(data map[string]string) *switchHooks {
++		return &switchHooks{configMaps: fakeConfigMaps{"hooks": {Data: data}}, name: "hooks"}
++	}
++	readLog := func() string {
++		b, err := os.ReadFile(log)
++		if os.IsNotExist(err) {
++			return ""
++		}
++		require.NoError(t, err)
++		require.NoError(t, os.Remove(log))
++		return string(b)
++	}
++
++	t.Run("runs the stage's entries in key order", func(t *testing.T) {
++		h := hooks(map[string]string{
++			"unbound.b-second": record("b"),
++			"unbound.a-first":  record("a"),
++			"bound.other":      record("bound"),
++			"unboundx":         record("no stage separator"),
++		})
++		require.NoError(t, h.run(hookStageUnbound, "0000:02:00.0", "nvidia"))
++		require.Equal(t, "a 0000:02:00.0 nvidia\nb 0000:02:00.0 nvidia\n", readLog())
++	})
++
++	t.Run("a failing hook fails the switch and stops the rest", func(t *testing.T) {
++		h := hooks(map[string]string{
++			"bound.a": "exit 3",
++			"bound.b": record("b"),
++		})
++		err := h.run(hookStageBound, "0000:02:00.0", "vfio-pci")
++		require.ErrorContains(t, err, `hook "bound.a" for GPU "0000:02:00.0" failed`)
++		require.Empty(t, readLog())
++	})
++
++	t.Run("no hooks configured", func(t *testing.T) {
++		var h *switchHooks
++		require.NoError(t, h.run(hookStageBound, "0000:02:00.0", "nvidia"))
++	})
++
++	t.Run("a missing ConfigMap fails the switch", func(t *testing.T) {
++		h := &switchHooks{configMaps: fakeConfigMaps{}, name: "hooks"}
++		require.ErrorContains(t, h.run(hookStageUnbound, "0000:02:00.0", "nvidia"), `error getting hook ConfigMap "hooks"`)
++	})
++}

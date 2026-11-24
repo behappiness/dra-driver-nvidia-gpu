@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Botond Lovasz <botilovasz@gmail.com>
 Date: Tue, 20 Oct 2026 23:48:38 +0200
-Subject: [PATCH 6/7] Let GPU clients that release on unbind not block a vfio
+Subject: [PATCH 6/8] Let GPU clients that release on unbind not block a vfio
  switch
 
 dcgm-exporter keeps every GPU open, and with its bind/unbind watch

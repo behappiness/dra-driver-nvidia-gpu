@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: swibrow <15628653+swibrow@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 05:51:17 +0200
-Subject: [PATCH 1/7] Scan /proc for GPU holders instead of running fuser
+Subject: [PATCH 1/8] Scan /proc for GPU holders instead of running fuser
 
 With PassthroughSupport enabled, WaitForGPUFree runs
 'chroot <host-root> fuser <driver-root>/dev/nvidiaN' before rebinding a

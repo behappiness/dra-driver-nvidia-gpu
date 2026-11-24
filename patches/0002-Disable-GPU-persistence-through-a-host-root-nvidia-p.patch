@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: swibrow <15628653+swibrow@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 05:53:07 +0200
-Subject: [PATCH 2/7] Disable GPU persistence through a host-root
+Subject: [PATCH 2/8] Disable GPU persistence through a host-root
  nvidia-persistenced
 
 disableGPUPersistenceMode only looks for the nvidia-persistenced socket under

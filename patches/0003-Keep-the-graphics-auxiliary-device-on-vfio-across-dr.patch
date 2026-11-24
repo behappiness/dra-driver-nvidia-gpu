@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: swibrow <15628653+swibrow@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 20:37:03 +0200
-Subject: [PATCH 3/7] Keep the graphics auxiliary device on vfio across driver
+Subject: [PATCH 3/8] Keep the graphics auxiliary device on vfio across driver
  switches
 
 nvpassthrough.Unbind also unbinds the GPU's graphics auxiliary (HDMI
